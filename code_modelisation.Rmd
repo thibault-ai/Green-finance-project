@@ -1,0 +1,738 @@
+---
+title: "Projet_EDF"
+author: "Thibault"
+date: '2025-01-10'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Configuration globale
+knitr::opts_knit$set(root.dir = "C:/Users/ordi/Desktop/ENSAE3A/Projet finance/Data_PFE")
+```
+
+
+```{r}
+# Chargement des bibliothèques nécessaires
+library(quantmod)
+library(rugarch)
+library(forecast)
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+library(ggplot2)
+library(quantmod)  # Pour calculer les rendements
+library(patchwork) # Pour combiner les graphiques
+library(lubridate)
+library(dplyr)
+library(xtable)
+library(mfGARCH)
+library(moments)   # Pour skewness et kurtosis
+library(tseries)   # Pour jarque.bera.test et adf.test
+library(FinTS)     # Pour ArchTest (ou utiliser urca pour une alternative)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(psych)
+library(parallel)
+library(rmgarch)
+library(zoo)
+library(forecast)
+library(vars)
+library(MTS)
+library(reshape2)
+
+```
+
+
+
+```{r}
+# Charger les données à partir d'un fichier CSV
+data <- read.csv("Base_sectorielle.csv", sep = ";")
+
+# Convertir la colonne 'Effective date ' en type Date
+data[[1]] <- as.Date(data[[1]], format = "%d/%m/%Y")
+
+# Renommer proprement la colonne
+names(data)[grepl("Effective.date", names(data))] <- "date"
+
+# Vérifier qu'elle est bien de type Date
+data$date <- as.Date(data$date)
+
+# Nettoyer les noms de colonnes
+colnames(data) <- gsub("(?i)S\\S*&?\\S*p\\S*500", " ", colnames(data))   # Supprime "S&P 500"  
+colnames(data) <- gsub("(?i)..Sector.", "", colnames(data)) # Supprime "SECTOR" insensible à la casse
+colnames(data) <- trimws(colnames(data))                    # Supprime les espaces en trop au début/fin
+
+# Afficher les premières lignes du tableau de données
+head(data)
+```
+
+
+```{r}
+str(data)
+```
+
+
+```{r}
+# Identifier les colonnes numériques (hors colonne Date)
+numeric_columns <- sapply(data, is.numeric)
+numeric_columns["date"] <- FALSE  # Exclure la colonne de date si elle est dans les numériques
+num_cols <- names(data)[numeric_columns]
+
+# Définir le nombre de colonnes pour l'affichage
+n_cols <- 3
+n_rows <- ceiling(length(num_cols) / n_cols)
+
+# Créer une liste de graphiques
+plots <- list()
+
+for (i in seq_along(num_cols)) {
+p <- ggplot(data, aes_string(x = "date", y = num_cols[i])) +
+    geom_line(color = "blue") +
+    ggtitle(paste(" ", num_cols[i])) +
+    xlab("Date") + ylab("Valeur") +
+    theme_minimal()
+  plots[[i]] <- p
+}
+
+# Afficher les graphiques avec gridExtra
+do.call("grid.arrange", c(plots, ncol = n_cols))
+```
+
+
+```{r}
+# Transformer les données en format long
+data_long <- pivot_longer(data, 
+                          cols = where(is.numeric), 
+                          names_to = "Secteur", 
+                          values_to = "Valeur")
+
+# Tracer toutes les séries temporelles sur un seul graphique
+ggplot(data_long, aes(x = date, y = Valeur, color = Secteur)) +
+  geom_line() +
+  labs(title = "Toutes les séries temporelles",
+       x = "Date",
+       y = "Valeur") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(ncol = 3))  # Ajuste le nombre de colonnes dans la légende si besoin
+
+```
+
+
+```{r}
+#Calcul des rendements des indices sectoriels
+library(dplyr)
+
+returns_final <- data %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(dplyr::across(
+    where(is.numeric),
+    ~ 100 * log(. / dplyr::lag(.)),  # Notez le dplyr::lag aussi
+    .names = "r_{.col}"
+  )) %>%
+  tidyr::drop_na() %>%  # Alternative à complete.cases()
+  dplyr::select(date, dplyr::starts_with("r_"))
+
+head(returns_final)
+```
+
+
+```{r}
+#Représentation des indice sectoriels
+# Identifier les colonnes numériques (hors colonne Date)
+numeric_columns <- sapply(returns_final, is.numeric)
+numeric_columns["date"] <- FALSE  # Exclure la colonne de date si elle est dans les numériques
+num_cols <- names(returns_final)[numeric_columns]
+
+# Définir le nombre de colonnes pour l'affichage
+n_cols <- 3
+n_rows <- ceiling(length(num_cols) / n_cols)
+
+# Créer une liste de graphiques
+plots <- list()
+
+for (i in seq_along(num_cols)) {
+p <- ggplot(returns_final, aes_string(x = "date", y = num_cols[i])) +
+    geom_line(color = "blue") +
+    ggtitle(paste(" ", num_cols[i])) +
+    xlab("Date") + ylab("rendement") +
+    theme_minimal()
+  plots[[i]] <- p
+}
+
+# Afficher les graphiques avec gridExtra
+do.call("grid.arrange", c(plots, ncol = n_cols))
+```
+
+
+
+```{r}
+# Charger les données sur l'indice CPU
+cpu <- read.csv("CPU index.csv")
+
+# Convertir la colonne 'date' au format Date
+cpu$date <- parse_date_time(cpu$date, orders = "my")
+
+# Supprimer la colonne "old_cpu_index"
+cpu$old_cpu_index <- NULL
+
+#filtre de l'indice cpu à partir de 2014
+cpu_data <- subset(cpu, cpu$date > as.Date("2012-12-31"))
+
+cpu_data$log_cpu <- log(cpu_data$cpu_index)
+
+head(cpu_data)
+```
+
+
+
+```{r}
+#extraction de la volatilité de la CPU via la méthode proposée dans Engle 2013
+# Conversion en série temporelle
+cpu_ts <- ts(cpu_data$log_cpu, 
+             start = c(2013, 1), 
+             frequency = 12)
+
+# Étape 2: Estimation de la volatilité CPUv selon la méthode du document
+# Le document indique que CPUv est obtenu en calculant le carré du vecteur résiduel
+# d'une régression de CPU sur des variables muettes mensuelles et des termes retardés
+
+# Création des variables muettes mensuelles
+cpu_data$month <- factor(format(cpu_data$date, "%m"))
+
+# Régression avec variables muettes et termes retardés (jusqu'à 12 mois)
+model <- lm(log_cpu ~ month + lag(log_cpu, 1) + lag(log_cpu, 2) + 
+              lag(log_cpu, 3) + lag(log_cpu, 4) + lag(log_cpu, 5) + 
+              lag(log_cpu, 6) + lag(log_cpu, 7) + lag(log_cpu, 8) + 
+              lag(log_cpu, 9) + lag(log_cpu, 10) + lag(log_cpu, 11) + 
+              lag(log_cpu, 12), 
+            data = cpu_data)
+
+# Extraction des résidus
+residuals <- residuals(model)
+
+cpu_data <- subset(cpu_data, cpu_data$date > as.Date("2013-12-31"))
+
+# Calcul de CPUv (volatilité) comme le carré des résidus
+cpu_data$cpuv <- residuals^2
+
+# Alternative: Estimation avec un modèle GARCH(1,1) comme mentionné en note de bas de page
+# Spécification du modèle GARCH
+spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+                   mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),distribution.model = "norm")
+
+# Ajustement du modèle GARCH
+garch_fit <- ugarchfit(spec = spec, data = cpu_data$log_cpu)
+
+# Extraction de la volatilité conditionnelle estimée
+cpu_data$cpuv_garch <- residuals(garch_fit)^2
+
+# Étape 3: Analyse des chocs asymétriques (CPUv+ et CPUv-)
+cpu_data <- cpu_data %>%
+  mutate(cpuv_plus = ifelse(residuals > 0, residuals^2, 0),
+         cpuv_minus = ifelse(residuals < 0, residuals^2, 0))
+
+head(cpu_data)
+```
+
+
+
+```{r}
+#Représentation graphique
+# 2. Calcul des log
+cpu_data <- cpu_data %>%
+  mutate(log_return = log(cpu_index))
+
+# 3. Représentation graphique de l'indice CPU
+plot_index <- ggplot(cpu_data, aes(x = date, y = cpu_index)) +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  labs(title = "Indice CPU (Climate Policy Uncertainty)",
+       subtitle = "Niveau de l'indice",
+       x = "Date",
+       y = "Valeur de l'indice") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# 4. Représentation graphique des log-rendements
+plot_returns <- ggplot(cpu_data, aes(x = date, y = log_return)) +
+  geom_line(color = "firebrick", linewidth = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(title = "logarithme de l'indice CPU",
+       subtitle = "Calculé comme ln(CPU_t)",
+       x = "Date",
+       y = "Log de l'indice") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# 5. Combinaison des deux graphiques
+combined_plot <- plot_index / plot_returns
+
+# Affichage
+print(combined_plot)
+```
+
+
+```{r}
+cpu_base <- subset(cpu_data[, c("date", "cpu_index", "log_cpu", "cpuv", "cpuv_garch","cpuv_plus", "cpuv_minus")], cpu_data$date > as.Date("2014-09-30"))
+head(cpu_base)
+```
+
+
+```{r}
+# Créer la colonne year_month au 1er jour du mois correspondant
+Base_f <- returns_final %>%
+  mutate(year_month = as.Date(format(date, "%Y-%m-01")))
+
+base_finale <- left_join(Base_f, cpu_base, by = c("year_month" = "date"))
+
+# Convertir la colonne 'year_month' au format Date
+base_finale$year_month <- as.Date(base_finale$year_month, format = "%d/%m/%Y")
+
+#suppression des valeurs manquantes
+base <- base_finale[complete.cases(base_finale), ]
+
+head(base)
+```
+
+
+```{r}
+str(base)
+```
+
+
+
+```{r}
+#Estimation du garch midas avec CPU exogène
+
+library(mfGARCH)
+#######################################################################################
+format_model <- function(dbr) {
+  # Function to format coefficients with significance stars
+  format_estimation <- function(coef, pval, se) {
+    stars <- ifelse(pval < 0.01, "***",
+                    ifelse(pval < 0.05, "**",
+                           ifelse(pval < 0.1, "*", "")))  # Adding significance stars
+    return(sprintf("%.3f%s (%.3f)", coef, stars, se))  # Format: coef*** (std)
+  }
+  
+  # Apply formatting function to dataframe
+  result_df <- data.frame(
+    Formatted_Result = mapply(format_estimation, dbr$estimate, dbr$p.value, dbr$rob.std.err),
+    row.names = dbr$term  # Set variable names as row index
+  )
+  
+  return(result_df)
+}
+
+##########################################################################################
+cols=colnames(base)
+mylist <- list()
+vol_cpu_list <- list()
+
+for (i in 2:12){
+result = fit_mfgarch(data = base, y = cols[i], x = cols[15], low.freq = "year_month", K = 30, gamma = FALSE)
+dbr = result$broom.mgarch
+res = format_model(dbr)
+new_list = list(mu = res["mu",],alpha = res["alpha",],beta=res["beta",],m=res["m",],theta=res["theta",],w=res["w2",],LLH=result$llh, BIC=result$bic, VR=result$variance.ratio)
+mylist[[i-1]] <- new_list
+
+#tau_df = data.frame(tau = result$tau)
+#names(tau_df) = paste0("tau_", cols[i])
+
+vol_cpu_list[[i-1]] <- list(result$tau)
+#vol_cpu_df = rbind (vol_cpu_df,tau_df)
+}
+
+df <- do.call(rbind, lapply(mylist, as.data.frame))
+rownames(df)=cols[2:12]
+print(df)
+##########################################################################################
+latex_table <- xtable(df)
+print(latex_table)
+
+vol_cpu_d <- do.call(cbind, lapply(vol_cpu_list, as.data.frame))
+```
+
+
+```{r}
+#Représentation des vol de long terme estimées par le GARCH midas avec cpu
+colnames(vol_cpu_d) = paste0("tau_", cols[2:12])
+temp_df = data.frame(date = base$year_month, log_cpu = base$log_cpu) # cpuv = base$cpuv)
+vol_cpu_df = cbind(temp_df, vol_cpu_d)
+
+vol_cpu_df_propre <- unique(na.omit(vol_cpu_df))
+#str(vol_cpu_df_propre)
+
+# Transformer les données en format long
+data_long <- pivot_longer(vol_cpu_df_propre, 
+                          cols = colnames(vol_cpu_df_propre)[c(2,3,4,6,9,10,11,12)], 
+                          names_to = "Secteur", 
+                          values_to = "Valeur")
+
+# Tracer toutes les séries temporelles sur un seul graphique
+ggplot(data_long, aes(x = date, y = Valeur, color = Secteur)) +
+  geom_line() +
+  labs(title = "CPU et volatilité sectorielle de long terme",
+       x = "Date",
+       y = "Volatilité") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(ncol = 3))  # Ajuste le nombre de colonnes dans la légende si besoin
+```
+
+
+
+
+```{r}
+#impact de la volatilité de la CPU - via un GARCH midas
+cols=colnames(base)
+mylist <- list()
+vol_cpuv_list <- list()
+
+for (i in 2:12){
+result = fit_mfgarch(data = base, y = cols[i], x = cols[16], low.freq = "year_month", K = 30, gamma = FALSE)
+dbr = result$broom.mgarch
+res = format_model(dbr)
+new_list = list(mu = res["mu",],alpha = res["alpha",],beta=res["beta",],m=res["m",],theta=res["theta",],w=res["w2",],LLH=result$llh, BIC=result$bic, VR=result$variance.ratio)
+mylist[[i-1]] <- new_list
+
+vol_cpuv_list[[i-1]] <- list(result$tau)
+}
+
+df <- do.call(rbind, lapply(mylist, as.data.frame))
+rownames(df)=cols[2:12]
+print(df)
+
+##########################################################################################
+latex_table <- xtable(df)
+print(latex_table)
+vol_cpuv_d <- do.call(cbind, lapply(vol_cpuv_list, as.data.frame))
+```
+
+
+```{r}
+#volatilité de long terme estimée par le modèle avec CPuv
+colnames(vol_cpuv_d) = paste0("tau_", cols[2:12])
+tempv_df = data.frame(date = base$year_month, cpuv = base$cpuv)
+vol_cpuv_df = cbind(tempv_df, vol_cpuv_d)
+
+vol_cpuv_df_propre <- unique(na.omit(vol_cpuv_df))
+
+# Transformer les données en format long
+data_long <- pivot_longer(vol_cpuv_df_propre, 
+                          cols = colnames(vol_cpuv_df_propre)[c(2,3,7)],#where(is.numeric), 
+                          names_to = "Secteur", 
+                          values_to = "Valeur")
+
+# Tracer toutes les séries temporelles sur un seul graphique
+ggplot(data_long, aes(x = date, y = Valeur, color = Secteur)) +
+  geom_line() +
+  labs(title = "CPUv et volatilité sectorielle de long terme",
+       x = "Date",
+       y = "Volatilité") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(ncol = 3))  # Ajuste le nombre de colonnes dans la légende si besoin
+```
+
+
+
+```{r}
+# Fonction pour calculer toutes les statistiques descriptives
+calculate_stats <- function(x, variable_name = "Variable") {
+  
+  # Statistiques descriptives de base
+  mean_val <- mean(x, na.rm = TRUE)
+  sd_val <- sd(x, na.rm = TRUE)
+  min_val <- min(x, na.rm = TRUE)
+  max_val <- max(x, na.rm = TRUE)
+  skew_val <- skewness(x, na.rm = TRUE)
+  kurt_val <- kurtosis(x, na.rm = TRUE)
+  
+  # Test de Jarque-Bera (normalité)
+  jb_test <- jarque.bera.test(x)
+  jb_stat <- jb_test$statistic
+  jb_pval <- jb_test$p.value
+  
+  # Test ADF (stationnarité)
+  adf_test <- adf.test(x)
+  adf_stat <- adf_test$statistic
+  adf_pval <- adf_test$p.value
+  
+  # Test ARCH (hétéroscédasticité)
+  arch_test <- ArchTest(x, lags = 1)
+  arch_stat <- arch_test$statistic
+  arch_pval <- arch_test$p.value
+  
+  # Création d'un dataframe de résultats
+  results <- data.frame(
+    Statistic = c("Mean", "Std. Dev", "Min", "Max", 
+                 "Skewness", "Kurtosis", 
+                 "J-B Stat", "J-B P-Value",
+                 "ADF Stat", "ADF P-Value",
+                 "ARCH Stat", "ARCH P-Value"),
+    Value = c(mean_val, sd_val, min_val, max_val,
+             skew_val, kurt_val,
+             jb_stat, jb_pval,
+             adf_stat, adf_pval,
+             arch_stat, arch_pval),
+    stringsAsFactors = FALSE
+  )
+  
+  # Formatage des valeurs numériques
+  results$Value <- round(results$Value, 4)
+  
+  # Ajout du nom de la variable
+  attr(results, "variable") <- variable_name
+  
+  return(results)
+}
+
+# Exemple d'utilisation avec une variable 'log_cpu'
+stats_log_cpu <- calculate_stats(cpu_base$log_cpu, "log_cpu")
+print(stats_log_cpu)
+```
+
+
+
+```{r}
+#Calcul de la vol des indices sectoriels
+library(dplyr)
+library(lubridate)  # Pour floor_date
+library(rugarch)    # Pour ugarchspec et ugarchfit
+
+# 1. Fonction GARCH améliorée avec gestion des erreurs
+compute_garch_residuals <- function(returns) {
+  # Validation des données d'entrée
+  valid_obs <- sum(!is.na(returns))
+  if(valid_obs < 100) {
+    message("Série a seulement ", valid_obs, " observations valides - retour NA")
+    return(rep(NA, length(returns)))
+  }
+  
+  # Spécification GARCH
+  spec <- ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+    mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),
+    distribution.model = "norm")
+  
+  # Estimation avec gestion des erreurs
+  tryCatch({
+    fit <- ugarchfit(spec, na.omit(returns))
+    res <- rep(NA, length(returns))
+    res[!is.na(returns)] <- residuals(fit)^2
+    return(res)
+  }, error = function(e) {
+    message("Erreur GARCH pour la série: ", e$message)
+    return(rep(NA, length(returns)))
+  })
+}
+
+# 2. Application aux séries sectorielles avec vérification
+
+df <- base# %>% mutate(across(all_of(sectors), ~ as.numeric(.)))  # S'assurer que les données sont numériques
+sectors <- grep("^r_", names(df), value = TRUE)
+
+# Application en une seule passe avec mutate(across)
+df <- df %>%
+  mutate(across(all_of(sectors), 
+                ~ compute_garch_residuals(.),
+                .names = "e2_{.col}"))
+
+# 3. Agrégation mensuelle optimisée
+base_monthly <- df %>%
+  dplyr::mutate(month = lubridate::floor_date(date, "month")) %>%
+  dplyr::select(-date) %>%
+  dplyr::select(month, dplyr::everything(), -dplyr::all_of(sectors)) %>%
+  dplyr::group_by(month) %>%
+  dplyr::summarise(
+    dplyr::across(where(is.numeric), ~ mean(., na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  dplyr::rename(date = month) %>%
+  dplyr::select(date, dplyr::everything())
+
+# Vérification finale
+glimpse(base_monthly)
+head(base_monthly)
+```
+
+
+
+
+
+```{r}
+vari <- grep("^r_", names(base_monthly), value = TRUE)
+base_month <- base_monthly[, !names(base_monthly) %in% c(vari,"year_month","cpuv_minus","cpu_index", "cpuv_plus","cpuv_garch")]
+head(base_month)
+```
+
+
+```{r}
+# Charger la bibliothèque
+library(writexl)
+
+# Exporter le data frame vers un fichier Excel
+write_xlsx(base_month, "base_month.xlsx")
+```
+
+
+
+```{r}
+#Estimation des corrélations dynamiques via le modèle DCC garch
+date <- base_month[, 1] 
+base_mon <- base_month[, -1] 
+n_series <- ncol(base_mon)
+myuspec = multispec(replicate(n_series, ugarchspec(mean.model = list(armaOrder = c(0,0)),
+             variance.model = list(model = "sGARCH", garchOrder = c(1,1)))))
+mydcc = dccspec(myuspec , VAR = TRUE, dccOrder = c(1, 1), distribution = 'mvnorm',
+               start.pars = list(alpha = 0.01, beta = 0.95))
+fit = dccfit(mydcc, data = base_mon, fit.control = list(eval.se = TRUE, rel.tol = 1e-8, maxit = 10000))
+fit
+```
+
+
+```{r}
+#Calcul des corrélations pour les représenter
+cbp<-rcor(fit)['log_cpu','e2_r_.Communication.Services',]
+cch<-rcor(fit)['log_cpu','e2_r_.Consumer.Discretionary',]
+ccn<-rcor(fit)['log_cpu','e2_r_.Consumer.Staples',]
+cen<-rcor(fit)['log_cpu','e2_r_.Energy',]
+cex<-rcor(fit)['log_cpu','e2_r_.Financials',]
+clu<-rcor(fit)['log_cpu','e2_r_.Health.Care',]
+cpe<-rcor(fit)['log_cpu','e2_r_.Industrials',]
+csh<-rcor(fit)['log_cpu','e2_r_.Information.Technology',]
+csi<-rcor(fit)['log_cpu','e2_r_.Materials',]
+cst<-rcor(fit)['log_cpu','e2_r_.Real.Estate',]
+cto<-rcor(fit)['log_cpu','e2_r_.Utilities',]
+
+cdf<-data.frame(date,cbp,cch,ccn,cen,cex,clu,cpe,csh,csi,cst,cto)
+cdf
+```
+
+
+```{r}
+#fonction pour représenter les corrélations dynamiqes
+plot_my_series <- function(y, dates, ylab, filename) {
+  # Conversion des dates en Date si ce n'est pas déjà le cas
+  if(!inherits(dates, "Date")) {
+    dates <- as.Date(dates)
+  }
+  
+  # Data frame principal
+  df <- data.frame(date = dates, y = y)
+  
+  # Data frame pour les événements (convertir en Date)
+  events_df <- data.frame(
+    date = as.Date(c("2015-12-01", "2016-04-01", "2016-11-01", "2021-11-01")),
+    event = c("Event A", "Event B", "Event C", "Event D")
+  )
+  
+  p <- ggplot(data = df, aes(x = date, y = y)) +
+    # Rectangle pour la période Covid
+    geom_rect(data = data.frame(
+      xmin = as.Date("2019-12-01"),
+      xmax = as.Date("2020-06-01")),
+      aes(xmin = xmin, xmax = xmax, fill = "Covid"),
+      ymin = -Inf, ymax = Inf, alpha = 0.3, inherit.aes = FALSE) +
+    
+    # Rectangle pour la période Guerre R-U
+    geom_rect(data = data.frame(
+      xmin = as.Date("2021-12-01"),
+      xmax = as.Date("2022-09-01")),
+      aes(xmin = xmin, xmax = xmax, fill = "Guerre R-U"),
+      ymin = -Inf, ymax = Inf, alpha = 0.3, inherit.aes = FALSE) +
+    
+    # Lignes verticales pour les événements
+    geom_vline(data = events_df,
+               aes(xintercept = as.numeric(date), color = event),
+               linetype = "dashed", linewidth = 1, show.legend = FALSE) +
+    
+    # Courbe principale
+    geom_line() +
+    
+    # Labels et thème
+    labs(x = "Années", y = ylab) +
+    theme_minimal() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      axis.line = element_line(colour = "black"),
+      legend.position = "none"
+    ) +
+    
+    # Couleurs personnalisées
+    scale_color_manual(values = c(
+      "Event A" = "orange",
+      "Event B" = "purple",
+      "Event C" = "green",
+      "Event D" = "red"
+    )) +
+    scale_fill_manual(values = c(
+      "Covid" = "grey",
+      "Guerre R-U" = "blue"
+    ))
+  
+  # Sauvegarde
+  ggsave(filename, plot = p, width = 8, height = 6, dpi = 300)
+  return(p)
+}
+```
+
+
+```{r}
+
+##Corrélation dynamique des indices sectoriels avec la CPU
+plot_my_series(cbp,cdf$date,"Corrélations_CPU_CS","CPU_CSplot.jpg")
+plot_my_series(cch,cdf$date,"Corrélations_CPU_CD","CPU_CDplot.jpg")
+plot_my_series(ccn,cdf$date,"Corrélations_CPU_Cst","CPU_Cstplot.jpg")
+plot_my_series(cen,cdf$date,"Corrélations_CPU_Energy","CPU_Energyplot.jpg")
+plot_my_series(cex,cdf$date,"Corrélations_CPU_Financials","CPU_Finplot.jpg")
+plot_my_series(clu,cdf$date,"Corrélations_CPU_HC","CPU_Hcplot.jpg")
+plot_my_series(cpe,cdf$date,"Corrélations_CPU_Ind","CPU_Indplot.jpg")
+plot_my_series(csh,cdf$date,"Corrélations_CPU_IT","CPU_ITplot.jpg")
+plot_my_series(csi,cdf$date,"Corrélations_CPU_Mat","CPU_Matplot.jpg")
+plot_my_series(cst,cdf$date,"Corrélations_CPU_Rest","CPU_Restplot.jpg")
+plot_my_series(cto,cdf$date,"Corrélations_CPU_Util","CPU_Utilplot.jpg")
+```
+
+
+
+```{r}
+#corrélations dynamiques indices sectoriels , cpuv
+cbp<-rcor(fit)['cpuv','e2_r_.Communication.Services',]
+cch<-rcor(fit)['cpuv','e2_r_.Consumer.Discretionary',]
+ccn<-rcor(fit)['cpuv','e2_r_.Consumer.Staples',]
+cen<-rcor(fit)['cpuv','e2_r_.Energy',]
+cex<-rcor(fit)['cpuv','e2_r_.Financials',]
+clu<-rcor(fit)['cpuv','e2_r_.Health.Care',]
+cpe<-rcor(fit)['cpuv','e2_r_.Industrials',]
+csh<-rcor(fit)['cpuv','e2_r_.Information.Technology',]
+csi<-rcor(fit)['cpuv','e2_r_.Materials',]
+cst<-rcor(fit)['cpuv','e2_r_.Real.Estate',]
+cto<-rcor(fit)['cpuv','e2_r_.Utilities',]
+
+cdf<-data.frame(date,cbp,cch,ccn,cen,cex,clu,cpe,csh,csi,cst,cto)
+cdf
+```
+
+
+```{r}
+##Corrélation dynamique des indices sectoriels avec la CPUv
+plot_my_series(cbp,cdf$date,"Corrélations_CPUv_CS","CPUv_CSplot.jpg")
+plot_my_series(cch,cdf$date,"Corrélations_CPUv_CD","CPUv_CDplot.jpg")
+plot_my_series(ccn,cdf$date,"Corrélations_CPUv_Cst","CPUv_Cstplot.jpg")
+plot_my_series(cen,cdf$date,"Corrélations_CPUv_Energy","CPUv_Energyplot.jpg")
+plot_my_series(cex,cdf$date,"Corrélations_CPUv_Financials","CPUv_Finplot.jpg")
+plot_my_series(clu,cdf$date,"Corrélations_CPUv_HC","CPUv_Hcplot.jpg")
+plot_my_series(cpe,cdf$date,"Corrélations_CPUv_Ind","CPUv_Indplot.jpg")
+plot_my_series(csh,cdf$date,"Corrélations_CPUv_IT","CPUv_ITplot.jpg")
+plot_my_series(csi,cdf$date,"Corrélations_CPUv_Mat","CPUv_Matplot.jpg")
+plot_my_series(cst,cdf$date,"Corrélations_CPUv_Rest","CPUv_Restplot.jpg")
+plot_my_series(cto,cdf$date,"Corrélations_CPUv_Util","CPUv_Utilplot.jpg")
+```
+
+
+
